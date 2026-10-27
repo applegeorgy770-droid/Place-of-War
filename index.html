@@ -2,7 +2,7 @@
 <html lang="ru">
 <head>
 <meta charset="UTF-8">
-<title>Тактический симулятор — улицы и кварталы</title>
+<title>Тактический симулятор — территории кругами</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -47,14 +47,13 @@
     position: absolute; bottom: 10px; left: 10px; z-index: 1000;
     background: rgba(15,25,40,.95); color: #cfd9e5; padding: 8px 11px;
     border-radius: 8px; font-size: 11px; border: 1px solid rgba(255,255,255,.08);
-    max-width: 340px; line-height: 1.5;
+    max-width: 360px; line-height: 1.5;
   }
   .unit-popup button {
     background: #2e7d32; color: #fff; border: none; padding: 5px 9px;
     border-radius: 4px; cursor: pointer; margin-top: 4px; font-size: 11px;
   }
   .unit-popup button.fire { background: #b71c1c; }
-  .unit-popup button.hold { background: #6a1b9a; }
 </style>
 </head>
 <body>
@@ -63,7 +62,6 @@
 
 <div id="toolbar">
   <button data-mode="select" class="active">🖱 Выбор</button>
-  <button data-mode="paint">🟩 Красить гексы</button>
   <button data-mode="unit">⚔ Отряд</button>
   <button data-mode="artillery">🎯 Артиллерия</button>
   <button data-mode="fort">🏰 Укрепление</button>
@@ -78,8 +76,8 @@
   <label>Имя отряда</label>
   <input id="nameInput" placeholder="напр. 1-я рота" />
 
-  <label>Размер гекса (градусы)</label>
-  <input id="hexSize" type="number" step="0.0005" value="0.0015" />
+  <label>Скорость отряда (км/мин)</label>
+  <input id="speedInput" type="number" step="0.1" value="0.8" />
 
   <div class="row">
     <button id="saveBtn">💾 Сохранить</button>
@@ -88,19 +86,19 @@
 </div>
 
 <div id="status">
-  Масштаб: уличный. Клик по гексу в режиме «Красить» захватывает ячейку вашей стороной. Отряд двигается по клику «Двигаться», бой — при сближении.
+  Отряды медленно расширяют территорию вокруг себя. Если враг перережет коридор — отрезанная часть переходит ему.
 </div>
 
 <script>
 /* ============================================================
-   1. КАРТА — уличный масштаб
+   1. КАРТА — реальная, уличный масштаб
    ============================================================ */
 const map = L.map('map', {
   worldCopyJump: true,
-  minZoom: 13,
-  maxZoom: 19,
+  minZoom: 12,
+  maxZoom: 18,
   zoomControl: true
-}).setView([52.5200, 13.4050], 15); // Берлин, вид с высоты квартала
+}).setView([52.5200, 13.4050], 14); // Берлин
 
 L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
   attribution: '&copy; OpenStreetMap contributors',
@@ -121,172 +119,39 @@ sideSelect.innerHTML = sides.map(s => `<option value="${s.id}">${s.name}</option
 function getSide(id) { return sides.find(s => s.id === id) || sides[0]; }
 
 /* ============================================================
-   3. ГЕКСАГОНАЛЬНАЯ СЕТКА
-   Вся карта покрыта ячейками, каждая ячейка — объект с координатой
-   центра и списком соседей. Территория = набор ячеек одной стороны.
+   3. ГЕОМЕТРИЯ (работаем в метрах, через проекцию Web Mercator)
+   Всё что связано с площадями и расстояниями — в метрах через map.distance.
    ============================================================ */
-const HEX_SIZE_DEFAULT = 0.0015; // ~150 метров по широте
-let hexSize = HEX_SIZE_DEFAULT;
-const hexMap = new Map(); // key = "q,r" -> {q, r, lat, lng, sideId, layerRef, encircled}
-
-function hexKey(q, r) { return q + ',' + r; }
-
-// Плоская (flat-top) гекс-сетка в градусах
-function hexToLatLng(q, r, size) {
-  const w = size * 2;
-  const h = size * Math.sqrt(3);
-  const lng = q * (w * 0.75);
-  const lat = (r - q * 0.5) * h;
-  return [lat, lng];
+function metersToLatLng(lat, lng, dxM, dyM) {
+  const p = map.project([lat, lng], 18);
+  return map.unproject([p.x + dxM / Math.cos(lat * Math.PI / 180) * (1), p.y - dyM], 18);
 }
-function latLngToHex(lat, lng, size) {
-  const w = size * 2;
-  const h = size * Math.sqrt(3);
-  const q = lng / (w * 0.75);
-  const r = lat / h + q * 0.5;
-  // округление до ближайшего гекса
-  return cubeRound(q, r);
-}
-function cubeRound(q, r) {
-  let x = q, z = r, y = -x - z;
-  let rx = Math.round(x), ry = Math.round(y), rz = Math.round(z);
-  const dx = Math.abs(rx - x), dy = Math.abs(ry - y), dz = Math.abs(rz - z);
-  if (dx > dy && dx > dz) rx = -ry - rz;
-  else if (dy > dz) ry = -rx - rz;
-  else rz = -rx - ry;
-  return [rx, rz];
-}
-
-function hexPolygon(lat, lng, size) {
-  const points = [];
-  for (let i = 0; i < 6; i++) {
-    const angle = Math.PI / 3 * i + Math.PI / 6;
-    const px = lng + size * Math.cos(angle) * 1.0;
-    const py = lat + size * Math.sin(angle) * 0.866;
-    points.push([py, px]);
+function circleToPolygon(center, radiusM, points = 24) {
+  const latlngs = [];
+  for (let i = 0; i < points; i++) {
+    const angle = (i / points) * 2 * Math.PI;
+    const dx = Math.cos(angle) * radiusM;
+    const dy = Math.sin(angle) * radiusM;
+    latlngs.push(metersToLatLng(center.lat, center.lng, dx, dy));
   }
-  return points;
-}
-
-const hexLayer = L.layerGroup().addTo(map);
-
-/* Инициализация: создаём сетку вокруг текущего вида (и при движении карты) */
-function buildHexGrid() {
-  hexLayer.clearLayers();
-  hexMap.clear();
-  const bounds = map.getBounds().pad(0.3);
-  const sw = bounds.getSouthWest(), ne = bounds.getNorthEast();
-
-  const stepLat = hexSize * 1.5;
-  const stepLng = hexSize * 1.5;
-
-  for (let lat = sw.lat; lat < ne.lat; lat += stepLat) {
-    for (let lng = sw.lng; lng < ne.lng; lng += stepLng) {
-      const [q, r] = latLngToHex(lat, lng, hexSize);
-      const key = hexKey(q, r);
-      if (hexMap.has(key)) continue;
-      const [hLat, hLng] = hexToLatLng(q, r, hexSize);
-      const hex = {
-        q, r, lat: hLat, lng: hLng,
-        sideId: null,
-        layerRef: null,
-        encircled: false
-      };
-      hexMap.set(key, hex);
-      drawHex(hex);
-    }
-  }
-}
-
-function drawHex(hex) {
-  const side = hex.sideId ? getSide(hex.sideId) : null;
-  const color = side ? side.color : '#3a4a5f';
-  const poly = L.polygon(hexPolygon(hex.lat, hex.lng, hexSize), {
-    color, weight: 1, opacity: 0.7,
-    fillColor: color, fillOpacity: side ? 0.35 : 0.06,
-    dashArray: hex.encircled ? '3,3' : null
-  }).addTo(hexLayer);
-  poly._hex = hex;
-  hex.layerRef = poly;
-
-  poly.on('click', () => {
-    if (mode === 'paint') {
-      const sideId = sideSelect.value;
-      setHexOwner(hex, sideId);
-      checkEncirclement();
-    } else if (mode === 'erase') {
-      setHexOwner(hex, null);
-      checkEncirclement();
-    }
-  });
-}
-
-function setHexOwner(hex, sideId) {
-  hex.sideId = sideId;
-  const side = sideId ? getSide(sideId) : null;
-  const color = side ? side.color : '#3a4a5f';
-  hex.layerRef.setStyle({
-    color, fillColor: color,
-    fillOpacity: side ? 0.35 : 0.06
-  });
-}
-
-/* Соседи гекса (в flat-top координатах) */
-function getNeighbors(q, r) {
-  const dirs = [
-    [1, 0], [1, -1], [0, -1],
-    [-1, 0], [-1, 1], [0, 1]
-  ];
-  return dirs.map(([dq, dr]) => hexMap.get(hexKey(q + dq, r + dr))).filter(Boolean);
+  return latlngs;
 }
 
 /* ============================================================
-   4. ОКРУЖЕНИЕ (кольцо)
-   Ячейка в окружении, если все её соседи принадлежат другой стороне
-   (или нейтральны, но контролируются врагом).
+   4. СОСТОЯНИЕ
    ============================================================ */
-function checkEncirclement() {
-  hexMap.forEach(hex => {
-    if (!hex.sideId) {
-      if (hex.encircled) { hex.encircled = false; hex.layerRef.setStyle({ dashArray: null }); }
-      return;
-    }
-    const neighbors = getNeighbors(hex.q, hex.r);
-    if (neighbors.length === 0) return;
-    const allEnemy = neighbors.every(n => n.sideId && n.sideId !== hex.sideId);
-    hex.encircled = allEnemy;
-    hex.layerRef.setStyle({ dashArray: allEnemy ? '3,3' : null });
-  });
-}
-
-/* Окружённые отряды теряют силу */
-setInterval(() => {
-  state.units.forEach(u => {
-    const [q, r] = latLngToHex(u.lat, u.lng, hexSize);
-    const hex = hexMap.get(hexKey(q, r));
-    if (hex && hex.encircled && hex.sideId !== u.sideId) {
-      u.strength -= 8;
-      if (u.strength <= 0) {
-        removeUnit(u);
-        updateStatus(`Отряд «${u.name}» уничтожен в окружении`);
-      }
-    }
-  });
-}, 4000);
-
-/* ============================================================
-   5. СЛОИ И СОСТОЯНИЕ
-   ============================================================ */
-const unitsLayer = L.layerGroup().addTo(map);
-const fortsLayer = L.layerGroup().addTo(map);
-const drawLayer  = L.layerGroup().addTo(map);
-
 const state = {
-  units: [],
+  units: [],   // { id, sideId, type, name, lat, lng, strength, controlRadius, maxRadius, cooldown, markerRef, zoneRef, areaRef }
   forts: []
 };
 let unitIdCounter = 0;
 let mode = 'select';
+
+/* Слой территорий (снизу) и слой отрядов (сверху) */
+const territoryLayer = L.layerGroup().addTo(map);
+const unitsLayer     = L.layerGroup().addTo(map);
+const fortsLayer     = L.layerGroup().addTo(map);
+const drawLayer      = L.layerGroup().addTo(map);
 
 /* Инструменты */
 document.getElementById('toolbar').addEventListener('click', e => {
@@ -297,17 +162,8 @@ document.getElementById('toolbar').addEventListener('click', e => {
     .forEach(b => b.classList.toggle('active', b === btn));
 });
 
-/* Перестройка сетки при движении карты и изменении размера */
-map.on('moveend', () => buildHexGrid());
-document.getElementById('hexSize').addEventListener('change', e => {
-  hexSize = parseFloat(e.target.value) || HEX_SIZE_DEFAULT;
-  buildHexGrid();
-});
-
-buildHexGrid();
-
 /* ============================================================
-   6. СОЗДАНИЕ ЮНИТОВ
+   5. СОЗДАНИЕ ОТРЯДОВ
    ============================================================ */
 map.on('click', e => {
   if (mode === 'unit') {
@@ -329,14 +185,18 @@ function createUnit(type, lat, lng) {
     sideId, type, name, lat, lng,
     strength: isArt ? 40 : 100,
     maxStrength: isArt ? 40 : 100,
-    attackRadius: isArt ? 4 : 2, // в гексах
+    controlRadius: 400,     // метров — начальный радиус влияния
+    maxRadius: isArt ? 600 : 1200,
+    attackRadius: isArt ? 2500 : 800, // дальность атаки
     cooldown: 0,
     moving: false,
     markerRef: null,
-    zoneRef: null
+    zoneRef: null,
+    areaRef: null
   };
   state.units.push(u);
   renderUnit(u);
+  updateTerritoryVisual(u);
 }
 
 function renderUnit(u) {
@@ -353,14 +213,15 @@ function renderUnit(u) {
     ">${isArt ? '🎯' : '⚔'}</div>`,
     iconSize: [0,0]
   });
-  const marker = L.marker([u.lat, u.lng], { icon }).addTo(unitsLayer);
+  const marker = L.marker([u.lat, u.lng], { icon, zIndexOffset: 1000 }).addTo(unitsLayer);
   u.markerRef = marker;
 
+  // Зона контроля (визуальная, растёт со временем)
   const zone = L.circle([u.lat, u.lng], {
-    radius: u.attackRadius * hexSize * 111000,
-    color: side.color, weight: 1,
-    fillColor: side.color, fillOpacity: 0.05,
-    dashArray: '3,4'
+    radius: u.controlRadius,
+    color: side.color, weight: 1.5,
+    fillColor: side.color, fillOpacity: 0.18,
+    dashArray: '4,4'
   }).addTo(unitsLayer);
   u.zoneRef = zone;
 
@@ -368,6 +229,7 @@ function renderUnit(u) {
     <b>${u.name}</b> (${side.name})<br>
     ${isArt ? 'Артиллерия' : 'Пехота'}<br>
     Сила: ${u.strength}/${u.maxStrength}<br>
+    Радиус: ${Math.round(u.controlRadius)} м<br>
     <button onclick="startMove(${u.id})">Двигаться</button>
     ${isArt ? `<button class="fire" onclick="startFire(${u.id})">Огонь</button>` : ''}
   </div>`;
@@ -381,7 +243,7 @@ function renderUnit(u) {
 function createFort(lat, lng) {
   const sideId = sideSelect.value;
   const name = document.getElementById('nameInput').value.trim() || 'Укрепление';
-  const fort = { sideId, name, lat, lng, radius: 2, markerRef: null, zoneRef: null };
+  const fort = { sideId, name, lat, lng, radius: 500, markerRef: null, zoneRef: null };
   state.forts.push(fort);
   const side = getSide(sideId);
   const icon = L.divIcon({
@@ -395,11 +257,11 @@ function createFort(lat, lng) {
     ">🏰</div>`,
     iconSize: [0,0]
   });
-  const marker = L.marker([lat, lng], { icon }).addTo(fortsLayer);
+  const marker = L.marker([lat, lng], { icon, zIndexOffset: 900 }).addTo(fortsLayer);
   fort.markerRef = marker;
   const zone = L.circle([lat, lng], {
-    radius: fort.radius * hexSize * 111000,
-    color: side.color, weight: 1, fillColor: side.color, fillOpacity: 0.06
+    radius: fort.radius,
+    color: side.color, weight: 1, fillColor: side.color, fillOpacity: 0.12
   }).addTo(fortsLayer);
   fort.zoneRef = zone;
   marker.bindPopup(`<b>${fort.name}</b> (${side.name})`);
@@ -409,6 +271,7 @@ function createFort(lat, lng) {
 function removeUnit(u) {
   if (u.markerRef) unitsLayer.removeLayer(u.markerRef);
   if (u.zoneRef) unitsLayer.removeLayer(u.zoneRef);
+  if (u.areaRef) territoryLayer.removeLayer(u.areaRef);
   state.units = state.units.filter(x => x !== u);
 }
 function removeFort(f) {
@@ -418,7 +281,131 @@ function removeFort(f) {
 }
 
 /* ============================================================
-   7. ДВИЖЕНИЕ С ЗАХВАТОМ ЯЧЕЕК
+   6. ТЕРРИТОРИЯ — ОБЪЕДИНЕНИЕ КРУГОВ
+   Каждый отряд «заливает» круг вокруг себя своим цветом.
+   Круги объединяются визуально через отдельный слой-полигон.
+   Для простоты храним территорию как набор кругов, а визуально
+   объединяем через L.Polygon с накопленными точками.
+   ============================================================ */
+
+/* Пересобирает полигон территории для отряда — круг, растущий со временем */
+function updateTerritoryVisual(u) {
+  const side = getSide(u.sideId);
+  const pts = circleToPolygon({ lat: u.lat, lng: u.lng }, u.controlRadius, 32);
+  if (u.areaRef) {
+    u.areaRef.setLatLngs(pts);
+    u.areaRef.setStyle({ color: side.color, fillColor: side.color });
+  } else {
+    u.areaRef = L.polygon(pts, {
+      color: side.color, weight: 1.5,
+      fillColor: side.color, fillOpacity: 0.25
+    }).addTo(territoryLayer);
+  }
+}
+
+/* Медленный рост радиуса — «отряд закрепляется» */
+setInterval(() => {
+  state.units.forEach(u => {
+    if (u.moving) return;
+    if (u.controlRadius < u.maxRadius) {
+      u.controlRadius = Math.min(u.maxRadius, u.controlRadius + 8); // +8 м каждые 2 сек
+      if (u.zoneRef) u.zoneRef.setRadius(u.controlRadius);
+      updateTerritoryVisual(u);
+      pushBackEnemies(u);
+      recolorTerritory();
+    }
+  });
+}, 2000);
+
+/* Если чужая территория попадает в наш круг — перекрашиваем её точку */
+function pushBackEnemies(u) {
+  // Если вражеский отряд внутри нашего круга — начинается бой (обрабатывается в checkBattles)
+}
+
+/* Перекраска территорий: если круг одного отряда накрывает круг другого —
+   более сильный перекрашивает слабого. Здесь просто перерисовываем все
+   территории по актуальным радиусам, чтобы избежать визуальных артефактов. */
+function recolorTerritory() {
+  state.units.forEach(u => {
+    if (u.areaRef) {
+      const side = getSide(u.sideId);
+      u.areaRef.setStyle({ color: side.color, fillColor: side.color });
+    }
+  });
+}
+
+/* ============================================================
+   7. ОТРЕЗ ТЕРРИТОРИИ (ОКРУЖЕНИЕ)
+   Простая модель: если между двумя отрядами одной стороны
+   стоит вражеский отряд (перерезал коридор), а другой отряд
+   оказывается в «мешке» — он теряет силу и его территория
+   переходит врагу.
+   Реализация: для каждого отряда проверяем, есть ли прямая
+   связь с «главной базой» стороны (условно — с самым сильным
+   отрядом этой стороны). Если связь перекрыта врагом — окружение.
+   ============================================================ */
+function checkEncirclement() {
+  sides.forEach(side => {
+    const ownUnits = state.units.filter(u => u.sideId === side.id);
+    if (ownUnits.length < 2) return;
+    // «База» = самый сильный отряд стороны
+    const base = ownUnits.reduce((a, b) => a.strength >= b.strength ? a : b);
+
+    ownUnits.forEach(u => {
+      if (u === base) return;
+      if (isPathBlocked(u, base)) {
+        // Отряд отрезан: теряет силу, территория перетекает врагу
+        u.strength -= 6;
+        if (u.strength <= 0) {
+          convertTerritoryToEnemy(u);
+          removeUnit(u);
+          updateStatus(`Отряд «${u.name}» уничтожен в окружении`);
+        } else {
+          u.markerRef.getPopup()?.setContent(`
+            <div class="unit-popup">
+              <b>${u.name}</b> (${side.name})<br>
+              ⚠️ В ОКРУЖЕНИИ<br>
+              Сила: ${u.strength}
+            </div>`);
+        }
+      }
+    });
+  });
+}
+
+/* Проверяем, есть ли на прямой между двумя отрядами вражеский отряд */
+function isPathBlocked(a, b) {
+  const steps = 12;
+  for (let i = 1; i < steps; i++) {
+    const t = i / steps;
+    const lat = a.lat + (b.lat - a.lat) * t;
+    const lng = a.lng + (b.lng - a.lng) * t;
+    for (const enemy of state.units) {
+      if (enemy.sideId === a.sideId) continue;
+      const d = map.distance([lat, lng], [enemy.lat, enemy.lng]);
+      if (d < enemy.attackRadius * 0.6) return true;
+    }
+  }
+  return false;
+}
+
+/* Когда отряд уничтожен в окружении — его территория достаётся ближайшему врагу */
+function convertTerritoryToEnemy(u) {
+  const enemy = state.units
+    .filter(x => x.sideId !== u.sideId)
+    .sort((a, b) => map.distance([u.lat, u.lng], [a.lat, a.lng]) -
+                    map.distance([u.lat, u.lng], [b.lat, b.lng]))[0];
+  if (enemy) {
+    enemy.controlRadius = Math.min(enemy.maxRadius + 400, enemy.controlRadius + u.controlRadius * 0.5);
+    if (enemy.zoneRef) enemy.zoneRef.setRadius(enemy.controlRadius);
+    updateTerritoryVisual(enemy);
+  }
+}
+
+setInterval(checkEncirclement, 5000);
+
+/* ============================================================
+   8. ДВИЖЕНИЕ
    ============================================================ */
 let pendingMoveUnit = null;
 let pendingFireUnit = null;
@@ -444,49 +431,45 @@ map.on('click', e => {
 
 function moveUnitTo(u, targetLat, targetLng) {
   const startLat = u.lat, startLng = u.lng;
-  // Скорость зависит от масштаба: на крупном (близком) зуме — медленнее
-  const zoomFactor = Math.max(0.3, (map.getZoom() - 12) / 7); // 0..1
-  const speedKmPerSec = 0.05 + zoomFactor * 0.2; // км/сек
-
   const distKm = map.distance([startLat, startLng], [targetLat, targetLng]) / 1000;
-  const travelSec = Math.max(1.2, distKm / speedKmPerSec);
+
+  // Скорость из поля ввода (км/мин игрового времени), переводим в км/сек
+  const speedKmMin = parseFloat(document.getElementById('speedInput').value) || 0.8;
+  const speedKmSec = speedKmMin / 60;
+  const travelSec = Math.max(2, distKm / speedKmSec);
+
+  // «Сжатие» времени: реальные travelSec игровых секунд = 1/6 реальных (ускоряем для играбельности)
+  const realSec = Math.max(2, travelSec / 6);
 
   u.moving = true;
-  const steps = Math.min(80, Math.max(15, Math.floor(travelSec * 4)));
+
+  // Территория во время движения перетекает за отрядом
+  const steps = Math.min(200, Math.max(20, Math.floor(realSec * 8)));
   let step = 0;
   const interval = setInterval(() => {
     step++;
     const t = step / steps;
-    const lat = startLat + (targetLat - startLat) * t;
-    const lng = startLng + (targetLng - startLng) * t;
-    u.lat = lat; u.lng = lng;
-    u.markerRef.setLatLng([lat, lng]);
-    u.zoneRef.setLatLng([lat, lng]);
+    u.lat = startLat + (targetLat - startLat) * t;
+    u.lng = startLng + (targetLng - startLng) * t;
+    u.markerRef.setLatLng([u.lat, u.lng]);
+    u.zoneRef.setLatLng([u.lat, u.lng]);
 
-    // Каждый шаг — проверяем захват текущей ячейки
-    captureCurrentHex(u);
+    // Территория следует за отрядом — старый круг «исчезает», новый появляется
+    updateTerritoryVisual(u);
 
     if (step >= steps) {
       clearInterval(interval);
       u.moving = false;
       checkBattles();
+      checkEncirclement();
     }
-  }, (travelSec * 1000) / steps);
-}
+  }, (realSec * 1000) / steps);
 
-function captureCurrentHex(u) {
-  const [q, r] = latLngToHex(u.lat, u.lng, hexSize);
-  const hex = hexMap.get(hexKey(q, r));
-  if (!hex) return;
-  if (hex.sideId && hex.sideId !== u.sideId) {
-    // Захват ячейки
-    setHexOwner(hex, u.sideId);
-    checkEncirclement();
-  }
+  updateStatus(`Отряд «${u.name}» движется (${distKm.toFixed(2)} км, ~${travelSec.toFixed(0)} сек)`);
 }
 
 /* ============================================================
-   8. АРТИЛЛЕРИЯ — удар по площади гексов
+   9. АРТИЛЛЕРИЯ
    ============================================================ */
 window.startFire = function(id) {
   const u = state.units.find(x => x.id === id);
@@ -504,35 +487,23 @@ map.on('click', e => {
   const u = pendingFireUnit;
   pendingFireUnit = null;
 
-  const blastRadiusHexes = 2;
-  const [cq, cr] = latLngToHex(e.latlng.lat, e.latlng.lng, hexSize);
-
-  // Визуал взрыва
+  const blastRadius = 1200; // метров
   const blast = L.circle(e.latlng, {
-    radius: blastRadiusHexes * hexSize * 111000,
-    color: '#ff5722', fillColor: '#ff5722', fillOpacity: 0.35, weight: 2
+    radius: blastRadius,
+    color: '#ff5722', fillColor: '#ff5722', fillOpacity: 0.4, weight: 2
   }).addTo(drawLayer);
   setTimeout(() => drawLayer.removeLayer(blast), 1800);
 
-  // Уничтожаем отряды в радиусе
   const toRemove = [];
   state.units.forEach(other => {
     if (other === u) return;
-    const [oq, or] = latLngToHex(other.lat, other.lng, hexSize);
-    const d = Math.max(Math.abs(cq - oq), Math.abs(cr - or), Math.abs((cq + cr) - (oq + or)));
-    if (d <= blastRadiusHexes) toRemove.push(other);
+    const d = map.distance(e.latlng, [other.lat, other.lng]);
+    if (d <= blastRadius) toRemove.push(other);
   });
   toRemove.forEach(removeUnit);
   if (toRemove.length) updateStatus(`Артиллерия уничтожила ${toRemove.length} отряд(ов)`);
 
-  // Нейтрализуем гексы в радиусе (разрушение)
-  hexMap.forEach(hex => {
-    const d = Math.max(Math.abs(cq - hex.q), Math.abs(cr - hex.r), Math.abs((cq + cr) - (hex.q + hex.r)));
-    if (d <= blastRadiusHexes) setHexOwner(hex, null);
-  });
-  checkEncirclement();
-
-  u.cooldown = 6;
+  u.cooldown = 8;
   const t = setInterval(() => {
     u.cooldown--;
     if (u.cooldown <= 0) clearInterval(t);
@@ -540,25 +511,22 @@ map.on('click', e => {
 });
 
 /* ============================================================
-   9. БОИ
+   10. БОИ
    ============================================================ */
 function checkBattles() {
   for (let i = 0; i < state.units.length; i++) {
     for (let j = i + 1; j < state.units.length; j++) {
       const a = state.units[i], b = state.units[j];
       if (a.sideId === b.sideId) continue;
-      const [aq, ar] = latLngToHex(a.lat, a.lng, hexSize);
-      const [bq, br] = latLngToHex(b.lat, b.lng, hexSize);
-      const d = Math.max(Math.abs(aq - bq), Math.abs(ar - br), Math.abs((aq + ar) - (bq + br)));
+      const d = map.distance([a.lat, a.lng], [b.lat, b.lng]);
       const contact = Math.min(a.attackRadius, b.attackRadius);
       if (d <= contact) {
-        // Бой
         if (a.strength > b.strength) {
-          b.strength -= 25; a.strength -= 8;
+          b.strength -= 20; a.strength -= 6;
         } else if (b.strength > a.strength) {
-          a.strength -= 25; b.strength -= 8;
+          a.strength -= 20; b.strength -= 6;
         } else {
-          a.strength -= 15; b.strength -= 15;
+          a.strength -= 12; b.strength -= 12;
         }
         if (a.strength <= 0) removeUnit(a);
         if (b.strength <= 0) removeUnit(b);
@@ -566,48 +534,36 @@ function checkBattles() {
     }
   }
 }
-
 setInterval(checkBattles, 3000);
 
 /* ============================================================
-   10. СОХРАНЕНИЕ
+   11. СОХРАНЕНИЕ
    ============================================================ */
 document.getElementById('saveBtn').onclick = () => {
   const data = {
-    hexSize,
-    hexes: [...hexMap.values()].map(h => ({ q: h.q, r: h.r, sideId: h.sideId })),
     units: state.units.map(u => ({
       id: u.id, sideId: u.sideId, type: u.type, name: u.name,
-      lat: u.lat, lng: u.lng, strength: u.strength, attackRadius: u.attackRadius
+      lat: u.lat, lng: u.lng, strength: u.strength,
+      controlRadius: u.controlRadius, maxRadius: u.maxRadius, attackRadius: u.attackRadius
     })),
     forts: state.forts.map(f => ({ sideId: f.sideId, name: f.name, lat: f.lat, lng: f.lng, radius: f.radius }))
   };
-  localStorage.setItem('tacticalSave', JSON.stringify(data));
+  localStorage.setItem('tacticalSave2', JSON.stringify(data));
   updateStatus('Сохранено');
 };
 
 document.getElementById('loadBtn').onclick = () => {
-  const raw = localStorage.getItem('tacticalSave');
+  const raw = localStorage.getItem('tacticalSave2');
   if (!raw) return updateStatus('Сохранений нет');
   const data = JSON.parse(raw);
-  if (data.hexSize) {
-    hexSize = data.hexSize;
-    document.getElementById('hexSize').value = hexSize;
-  }
-  hexLayer.clearLayers(); hexMap.clear();
-  unitsLayer.clearLayers(); fortsLayer.clearLayers();
+  unitsLayer.clearLayers(); fortsLayer.clearLayers(); territoryLayer.clearLayers();
   state.units = []; state.forts = []; unitIdCounter = 0;
-  buildHexGrid();
-  (data.hexes || []).forEach(h => {
-    const hex = hexMap.get(hexKey(h.q, h.r));
-    if (hex) setHexOwner(hex, h.sideId);
-  });
   (data.units || []).forEach(u => {
-    const nu = { ...u, moving: false, cooldown: 0, markerRef: null, zoneRef: null,
-                 maxStrength: u.type === 'artillery' ? 40 : 100 };
+    const nu = { ...u, moving: false, cooldown: 0, markerRef: null, zoneRef: null, areaRef: null };
     state.units.push(nu);
     if (u.id > unitIdCounter) unitIdCounter = u.id;
     renderUnit(nu);
+    updateTerritoryVisual(nu);
   });
   (data.forts || []).forEach(f => createFort(f.lat, f.lng));
   updateStatus('Загружено');
@@ -615,9 +571,8 @@ document.getElementById('loadBtn').onclick = () => {
 
 document.getElementById('clearAll').onclick = () => {
   if (!confirm('Очистить карту?')) return;
-  hexLayer.clearLayers(); unitsLayer.clearLayers(); fortsLayer.clearLayers();
-  hexMap.clear(); state.units = []; state.forts = [];
-  buildHexGrid();
+  unitsLayer.clearLayers(); fortsLayer.clearLayers(); territoryLayer.clearLayers();
+  state.units = []; state.forts = [];
 };
 
 function updateStatus(text) {
