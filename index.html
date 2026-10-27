@@ -2,10 +2,11 @@
 <html lang="ru">
 <head>
 <meta charset="UTF-8">
-<title>Вологда — тактический симулятор</title>
+<title>Вологда — тактический симулятор (единая территория)</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/@turf/turf@6/turf.min.js"></script>
 <style>
   * { box-sizing: border-box; }
   html, body { margin: 0; height: 100%; font-family: system-ui, sans-serif; }
@@ -54,6 +55,9 @@
     border-radius: 4px; cursor: pointer; margin-top: 4px; font-size: 11px;
   }
   .unit-popup button.fire { background: #b71c1c; }
+  .unit-popup button.fire:disabled {
+    background: #555; cursor: not-allowed; opacity: .7;
+  }
 </style>
 </head>
 <body>
@@ -86,7 +90,7 @@
 </div>
 
 <div id="status">
-  Вологда. Территории остаются за захватчиком. Противник, проходящий по вашей земле, перекрашивает её в свой цвет.
+  Вологда. Территория каждой стороны — единый полигон. Круги отрядов сливаются в общую область.
 </div>
 
 <script>
@@ -94,17 +98,12 @@
    1. КАРТА — Вологда
    ============================================================ */
 const VOLOGDA = [59.2205, 39.8915];
-
 const map = L.map('map', {
-  worldCopyJump: true,
-  minZoom: 12,
-  maxZoom: 18,
-  zoomControl: true
+  worldCopyJump: true, minZoom: 12, maxZoom: 18
 }).setView(VOLOGDA, 14);
 
 L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
-  attribution: '&copy; OpenStreetMap contributors',
-  maxZoom: 19
+  attribution: '&copy; OpenStreetMap contributors', maxZoom: 19
 }).addTo(map);
 
 /* ============================================================
@@ -121,35 +120,28 @@ sideSelect.innerHTML = sides.map(s => `<option value="${s.id}">${s.name}</option
 function getSide(id) { return sides.find(s => s.id === id) || sides[0]; }
 
 /* ============================================================
-   3. ГЕОМЕТРИЯ
+   3. ГЕОМЕТРИЯ: круг → turf polygon, слияние через union
    ============================================================ */
-function metersToLatLng(lat, lng, dxM, dyM) {
-  const p = map.project([lat, lng], 18);
-  return map.unproject([p.x + dxM, p.y - dyM], 18);
-}
-function circleToPolygon(center, radiusM, points = 24) {
-  const latlngs = [];
-  for (let i = 0; i < points; i++) {
-    const angle = (i / points) * 2 * Math.PI;
-    const dx = Math.cos(angle) * radiusM;
-    const dy = Math.sin(angle) * radiusM;
-    latlngs.push(metersToLatLng(center.lat, center.lng, dx, dy));
-  }
-  return latlngs;
+function circleToTurf(centerLat, centerLng, radiusM, steps = 48) {
+  return turf.circle([centerLng, centerLat], radiusM / 1000, { steps, units: 'kilometers' });
 }
 
 /* ============================================================
-   4. СОСТОЯНИЕ
+   4. СОСТОЯНИЕ — одна территория на каждую сторону (turf Feature)
    ============================================================ */
 const state = {
   units: [],
   forts: [],
-  patches: []  // { sideId, lat, lng, radius, layerRef }
+  // territory[sideId] = turf.Feature<Polygon|MultiPolygon> или null
+  territory: {},
+  // слои Leaflet для отрисовки территории
+  territoryRefs: {}
 };
+sides.forEach(s => { state.territory[s.id] = null; });
+
 let unitIdCounter = 0;
 let mode = 'select';
 
-/* Слой территорий (снизу) */
 const territoryLayer = L.layerGroup().addTo(map);
 const unitsLayer     = L.layerGroup().addTo(map);
 const fortsLayer     = L.layerGroup().addTo(map);
@@ -164,51 +156,71 @@ document.getElementById('toolbar').addEventListener('click', e => {
 });
 
 /* ============================================================
-   5. ТЕРРИТОРИЯ — постоянные пятна
+   5. ОБНОВЛЕНИЕ ТЕРРИТОРИИ
    ============================================================ */
-const PATCH_RESOLUTION = 150; // минимальное расстояние между пятнами (м)
+function stampTerritory(sideId, lat, lng, radius) {
+  const side = getSide(sideId);
+  const brush = circleToTurf(lat, lng, radius);
 
-function stampPatch(sideId, lat, lng, radius) {
-  // Проверяем: не покрыто ли это место уже пятном этого же цвета с похожим радиусом
-  const existingSame = state.patches.find(p =>
-    p.sideId === sideId &&
-    map.distance([lat, lng], [p.lat, p.lng]) < PATCH_RESOLUTION &&
-    Math.abs(p.radius - radius) < radius * 0.4
-  );
-  if (existingSame) return;
+  // 1) Объединяем кисть с собственной территорией
+  let own = state.territory[sideId];
+  if (own) {
+    try { own = turf.union(own, brush); } catch(e) { own = brush; }
+  } else {
+    own = brush;
+  }
+  state.territory[sideId] = own;
 
-  // Ищем чужие пятна, которые накрываются нашим — их удаляем / перекрашиваем
-  const enemies = state.patches.filter(p => {
-    if (p.sideId === sideId) return false;
-    const d = map.distance([lat, lng], [p.lat, p.lng]);
-    return d < radius + p.radius * 0.6;
+  // 2) Вычитаем эту кисть (с запасом) из территорий всех врагов
+  sides.forEach(s => {
+    if (s.id === sideId) return;
+    if (!state.territory[s.id]) return;
+    try {
+      const diff = turf.difference(state.territory[s.id], brush);
+      state.territory[s.id] = diff; // может стать null, если полностью съедено
+    } catch(e) { /* пропускаем */ }
   });
 
-  enemies.forEach(e => {
-    // Перекрашиваем: удаляем чужое пятно, ставим на его место своё
-    territoryLayer.removeLayer(e.layerRef);
-    state.patches = state.patches.filter(p => p !== e);
-    // На месте чужого пятна ставим своё
-    addPatch(sideId, e.lat, e.lng, e.radius);
-  });
-
-  // Ставим новое пятно
-  addPatch(sideId, lat, lng, radius);
-
-  // Перепроверяем окружение — если что-то отрезано, отдаём врагу
-  checkEncirclement();
+  // 3) Перерисовываем все территории
+  redrawAllTerritories();
 }
 
-function addPatch(sideId, lat, lng, radius) {
-  const side = getSide(sideId);
-  const pts = circleToPolygon({ lat, lng }, radius, 24);
-  const poly = L.polygon(pts, {
-    color: side.color, weight: 1,
-    fillColor: side.color, fillOpacity: 0.35
-  }).addTo(territoryLayer);
-  const patch = { sideId, lat, lng, radius, layerRef: poly };
-  state.patches.push(patch);
-  return patch;
+function redrawAllTerritories() {
+  sides.forEach(s => {
+    const feat = state.territory[s.id];
+    const ref = state.territoryRefs[s.id];
+
+    if (!feat) {
+      if (ref) { territoryLayer.removeLayer(ref); delete state.territoryRefs[s.id]; }
+      return;
+    }
+
+    const latlngs = turfToLatLngs(feat);
+    if (ref) {
+      ref.setLatLngs(latlngs);
+      ref.setStyle({ color: s.color, fillColor: s.color });
+    } else {
+      const poly = L.polygon(latlngs, {
+        color: s.color, weight: 2,
+        fillColor: s.color, fillOpacity: 0.35
+      }).addTo(territoryLayer);
+      state.territoryRefs[s.id] = poly;
+    }
+  });
+}
+
+/* Преобразование turf geometry в latlngs для Leaflet (учитываем Polygon и MultiPolygon) */
+function turfToLatLngs(feat) {
+  const g = feat.geometry;
+  if (g.type === 'Polygon') {
+    // координаты [lng, lat]
+    return g.coordinates.map(ring => ring.map(c => [c[1], c[0]]));
+  }
+  if (g.type === 'MultiPolygon') {
+    // Leaflet умеет массив массивов для multipolygon
+    return g.coordinates.map(poly => poly.map(ring => ring.map(c => [c[1], c[0]])));
+  }
+  return [];
 }
 
 /* ============================================================
@@ -230,9 +242,10 @@ function createUnit(type, lat, lng) {
     sideId, type, name, lat, lng,
     strength: isArt ? 40 : 100,
     maxStrength: isArt ? 40 : 100,
-    controlRadius: 300,        // радиус «штампа» территории
-    attackRadius: isArt ? 400 : 600,  // дальность удара (у артиллерии уменьшено)
-    cooldown: 0,
+    controlRadius: 300,
+    attackRadius: isArt ? 400 : 600,
+    cooldown: 0,         // секунд до перезарядки
+    cooldownTotal: 8,
     moving: false,
     lastStamp: 0,
     markerRef: null,
@@ -240,8 +253,7 @@ function createUnit(type, lat, lng) {
   };
   state.units.push(u);
   renderUnit(u);
-  // Первый штамп при создании
-  stampPatch(u.sideId, u.lat, u.lng, u.controlRadius);
+  stampTerritory(u.sideId, u.lat, u.lng, u.controlRadius);
 }
 
 function renderUnit(u) {
@@ -249,13 +261,13 @@ function renderUnit(u) {
   const isArt = u.type === 'artillery';
   const icon = L.divIcon({
     className: '',
-    html: `<div style="
+    html: `<div class="unit-marker" style="
       width:${isArt ? 26 : 30}px;height:${isArt ? 26 : 30}px;border-radius:50%;
       background:${side.color};border:2px solid #fff;
       display:flex;align-items:center;justify-content:center;
       font-size:${isArt ? 13 : 15}px;box-shadow:0 2px 10px rgba(0,0,0,.7);
-      transform:translate(-50%,-50%);
-    ">${isArt ? '🎯' : '⚔'}</div>`,
+      transform:translate(-50%,-50%); position:relative;
+    ">${isArt ? '🎯' : '⚔'}<span class="cd-badge"></span></div>`,
     iconSize: [0,0]
   });
   const marker = L.marker([u.lat, u.lng], { icon, zIndexOffset: 1000 }).addTo(unitsLayer);
@@ -269,15 +281,40 @@ function renderUnit(u) {
   }).addTo(unitsLayer);
   u.zoneRef = zone;
 
+  updatePopup(u);
+  marker.on('click', () => { if (mode === 'erase') removeUnit(u); });
+}
+
+function updatePopup(u) {
+  const side = getSide(u.sideId);
+  const isArt = u.type === 'artillery';
+  const fireDisabled = u.cooldown > 0 ? 'disabled' : '';
+  const fireLabel = u.cooldown > 0 ? `Перезарядка (${u.cooldown}с)` : 'Огонь';
   const popup = `<div class="unit-popup">
     <b>${u.name}</b> (${side.name})<br>
     ${isArt ? 'Артиллерия' : 'Пехота'}<br>
     Сила: ${u.strength}/${u.maxStrength}<br>
     <button onclick="startMove(${u.id})">Двигаться</button>
-    ${isArt ? `<button class="fire" onclick="startFire(${u.id})">Огонь</button>` : ''}
+    ${isArt ? `<button class="fire" ${fireDisabled} onclick="startFire(${u.id})">${fireLabel}</button>` : ''}
   </div>`;
-  marker.bindPopup(popup);
-  marker.on('click', () => { if (mode === 'erase') removeUnit(u); });
+  u.markerRef.bindPopup(popup);
+  // Обновляем бейдж на маркере
+  const badge = u.markerRef.getElement()?.querySelector('.cd-badge');
+  if (badge) {
+    if (u.cooldown > 0) {
+      badge.textContent = u.cooldown;
+      badge.style.cssText = `
+        position:absolute;top:-6px;right:-6px;
+        background:#b71c1c;color:#fff;border-radius:50%;
+        width:16px;height:16px;font-size:10px;
+        display:flex;align-items:center;justify-content:center;
+        border:1px solid #fff;
+      `;
+    } else {
+      badge.textContent = '';
+      badge.style.cssText = 'display:none';
+    }
+  }
 }
 
 function createFort(lat, lng) {
@@ -306,8 +343,7 @@ function createFort(lat, lng) {
   fort.zoneRef = zone;
   marker.bindPopup(`<b>${fort.name}</b> (${side.name})`);
   marker.on('click', () => { if (mode === 'erase') removeFort(fort); });
-  // Укрепление тоже штампует территорию
-  stampPatch(sideId, lat, lng, fort.radius);
+  stampTerritory(sideId, lat, lng, fort.radius);
 }
 
 function removeUnit(u) {
@@ -322,7 +358,7 @@ function removeFort(f) {
 }
 
 /* ============================================================
-   7. ДВИЖЕНИЕ — с оставлением пятен территории
+   7. ДВИЖЕНИЕ
    ============================================================ */
 let pendingMoveUnit = null;
 let pendingFireUnit = null;
@@ -353,7 +389,6 @@ function moveUnitTo(u, targetLat, targetLng) {
   const speedKmMin = parseFloat(document.getElementById('speedInput').value) || 0.15;
   const speedKmSec = speedKmMin / 60;
   const travelSec = Math.max(3, distKm / speedKmSec);
-  // Ускорение для играбельности: реальное время = travelSec / 8
   const realSec = Math.max(2, travelSec / 8);
 
   u.moving = true;
@@ -368,18 +403,16 @@ function moveUnitTo(u, targetLat, targetLng) {
     u.markerRef.setLatLng([u.lat, u.lng]);
     u.zoneRef.setLatLng([u.lat, u.lng]);
 
-    // Штамп территории каждые N метров (не каждый шаг, чтобы не засорять)
     const now = Date.now();
-    if (now - u.lastStamp > 150) { // каждые 150 мс реального времени
-      stampPatch(u.sideId, u.lat, u.lng, u.controlRadius);
+    if (now - u.lastStamp > 200) {
+      stampTerritory(u.sideId, u.lat, u.lng, u.controlRadius);
       u.lastStamp = now;
     }
 
     if (step >= steps) {
       clearInterval(interval);
       u.moving = false;
-      // Финальный штамп
-      stampPatch(u.sideId, u.lat, u.lng, u.controlRadius);
+      stampTerritory(u.sideId, u.lat, u.lng, u.controlRadius);
       checkBattles();
       checkEncirclement();
     }
@@ -390,8 +423,6 @@ function moveUnitTo(u, targetLat, targetLng) {
 
 /* ============================================================
    8. ОКРУЖЕНИЕ
-   Если отряд одной стороны отрезан от остальных вражескими пятнами —
-   его территория постепенно переходит врагу.
    ============================================================ */
 function checkEncirclement() {
   sides.forEach(side => {
@@ -404,31 +435,18 @@ function checkEncirclement() {
       if (isPathBlocked(u, base)) {
         u.strength -= 4;
         if (u.strength <= 0) {
-          // Территория отряда переходит ближайшему врагу
+          // Территория вокруг него переходит врагу
           const enemy = state.units
             .filter(x => x.sideId !== u.sideId)
             .sort((a, b) => map.distance([u.lat, u.lng], [a.lat, a.lng]) -
                             map.distance([u.lat, u.lng], [b.lat, b.lng]))[0];
           if (enemy) {
-            // Перекрашиваем все пятна этого отряда в цвет врага
-            state.patches.forEach(p => {
-              if (map.distance([u.lat, u.lng], [p.lat, p.lng]) < u.controlRadius * 2 &&
-                  p.sideId === u.sideId) {
-                const side2 = getSide(enemy.sideId);
-                p.sideId = enemy.sideId;
-                p.layerRef.setStyle({ color: side2.color, fillColor: side2.color });
-              }
-            });
+            stampTerritory(enemy.sideId, u.lat, u.lng, u.controlRadius * 1.5);
           }
           removeUnit(u);
           updateStatus(`Отряд «${u.name}» уничтожен в окружении`);
         } else {
-          u.markerRef.getPopup()?.setContent(`
-            <div class="unit-popup">
-              <b>${u.name}</b> (${side.name})<br>
-              ⚠️ В ОКРУЖЕНИИ<br>
-              Сила: ${u.strength}
-            </div>`);
+          updatePopup(u);
         }
       }
     });
@@ -453,12 +471,13 @@ function isPathBlocked(a, b) {
 setInterval(checkEncirclement, 5000);
 
 /* ============================================================
-   9. АРТИЛЛЕРИЯ — радиус удара уменьшен
+   9. АРТИЛЛЕРИЯ С ТАЙМЕРОМ ПЕРЕЗАРЯДКИ
    ============================================================ */
 window.startFire = function(id) {
   const u = state.units.find(x => x.id === id);
-  if (!u || u.type !== 'artillery' || u.cooldown > 0) {
-    updateStatus('Артиллерия перезаряжается');
+  if (!u || u.type !== 'artillery') return;
+  if (u.cooldown > 0) {
+    updateStatus(`Перезарядка: ${u.cooldown} с`);
     return;
   }
   map.closePopup();
@@ -471,7 +490,7 @@ map.on('click', e => {
   const u = pendingFireUnit;
   pendingFireUnit = null;
 
-  const blastRadius = 400; // метров — меньше
+  const blastRadius = 400;
   const blast = L.circle(e.latlng, {
     radius: blastRadius,
     color: '#ff5722', fillColor: '#ff5722', fillOpacity: 0.4, weight: 2
@@ -487,10 +506,16 @@ map.on('click', e => {
   toRemove.forEach(removeUnit);
   if (toRemove.length) updateStatus(`Артиллерия уничтожила ${toRemove.length} отряд(ов)`);
 
-  u.cooldown = 8;
+  // Запускаем таймер перезарядки
+  u.cooldown = u.cooldownTotal;
+  updatePopup(u);
   const t = setInterval(() => {
     u.cooldown--;
-    if (u.cooldown <= 0) clearInterval(t);
+    updatePopup(u);
+    if (u.cooldown <= 0) {
+      clearInterval(t);
+      updatePopup(u);
+    }
   }, 1000);
 });
 
@@ -525,32 +550,50 @@ setInterval(checkBattles, 3000);
    ============================================================ */
 document.getElementById('saveBtn').onclick = () => {
   const data = {
+    territory: {},
     units: state.units.map(u => ({
       id: u.id, sideId: u.sideId, type: u.type, name: u.name,
       lat: u.lat, lng: u.lng, strength: u.strength,
-      controlRadius: u.controlRadius, attackRadius: u.attackRadius
+      controlRadius: u.controlRadius, attackRadius: u.attackRadius,
+      cooldown: u.cooldown, cooldownTotal: u.cooldownTotal
     })),
-    forts: state.forts.map(f => ({ sideId: f.sideId, name: f.name, lat: f.lat, lng: f.lng, radius: f.radius })),
-    patches: state.patches.map(p => ({ sideId: p.sideId, lat: p.lat, lng: p.lng, radius: p.radius }))
+    forts: state.forts.map(f => ({ sideId: f.sideId, name: f.name, lat: f.lat, lng: f.lng, radius: f.radius }))
   };
-  localStorage.setItem('vologdaSave', JSON.stringify(data));
+  sides.forEach(s => { data.territory[s.id] = state.territory[s.id]; });
+  localStorage.setItem('vologdaSave2', JSON.stringify(data));
   updateStatus('Сохранено');
 };
 
 document.getElementById('loadBtn').onclick = () => {
-  const raw = localStorage.getItem('vologdaSave');
+  const raw = localStorage.getItem('vologdaSave2');
   if (!raw) return updateStatus('Сохранений нет');
   const data = JSON.parse(raw);
   unitsLayer.clearLayers(); fortsLayer.clearLayers(); territoryLayer.clearLayers();
-  state.units = []; state.forts = []; state.patches = []; unitIdCounter = 0;
+  state.units = []; state.forts = []; state.territory = {}; state.territoryRefs = {};
+  sides.forEach(s => { state.territory[s.id] = null; });
+  unitIdCounter = 0;
 
-  (data.patches || []).forEach(p => addPatch(p.sideId, p.lat, p.lng, p.radius));
+  sides.forEach(s => {
+    if (data.territory && data.territory[s.id]) {
+      state.territory[s.id] = data.territory[s.id];
+    }
+  });
+  redrawAllTerritories();
+
   (data.units || []).forEach(u => {
-    const nu = { ...u, moving: false, cooldown: 0, lastStamp: 0,
-                 markerRef: null, zoneRef: null, maxStrength: u.type === 'artillery' ? 40 : 100 };
+    const nu = { ...u, moving: false, lastStamp: 0,
+                 markerRef: null, zoneRef: null,
+                 maxStrength: u.type === 'artillery' ? 40 : 100 };
     state.units.push(nu);
     if (u.id > unitIdCounter) unitIdCounter = u.id;
     renderUnit(nu);
+    if (nu.cooldown > 0) {
+      const t = setInterval(() => {
+        nu.cooldown--;
+        updatePopup(nu);
+        if (nu.cooldown <= 0) clearInterval(t);
+      }, 1000);
+    }
   });
   (data.forts || []).forEach(f => createFort(f.lat, f.lng));
   updateStatus('Загружено');
@@ -559,7 +602,8 @@ document.getElementById('loadBtn').onclick = () => {
 document.getElementById('clearAll').onclick = () => {
   if (!confirm('Очистить карту?')) return;
   unitsLayer.clearLayers(); fortsLayer.clearLayers(); territoryLayer.clearLayers();
-  state.units = []; state.forts = []; state.patches = [];
+  state.units = []; state.forts = []; state.territory = {}; state.territoryRefs = {};
+  sides.forEach(s => { state.territory[s.id] = null; });
 };
 
 function updateStatus(text) {
